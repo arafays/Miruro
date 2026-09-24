@@ -1,5 +1,6 @@
 import axios from 'axios';
 import { year, getCurrentSeason, getNextSeason } from '../index';
+import type { Episode } from './animeInterface';
 
 // Utility function to ensure URL ends with a slash
 function ensureUrlEndsWithSlash(url: string): string {
@@ -30,13 +31,99 @@ const axiosInstance = axios.create({
   },
 });
 
+// ---- Local Miruro-API integration -------------------------------------
+// Self-hosted walterwhite-69/Miruro-API instance serving consumet-style
+// /episodes and /watch routes. Runs locally on port 8000 during development;
+// override with VITE_MIRURO_API for a deployed instance.
+const MIRURO_API = ensureUrlEndsWithSlash(
+  import.meta.env.VITE_MIRURO_API || 'http://localhost:8000/',
+);
+
+const miruroInstance = axios.create({
+  baseURL: MIRURO_API,
+  timeout: 30000,
+  headers: { Accept: 'application/json' },
+});
+
+// Provider preference order: verified-working sources first, known-dead
+// scrapers last (fallback in fetchAnimeStreamingLinks retries on failure).
+const MIRURO_PROVIDER_ORDER = [
+  'moo',
+  'pewe',
+  'kiwi',
+  'hop',
+  'ally',
+  'bee',
+  'bonk',
+];
+
+// Miruro-API episode id: watch/{provider}/{anilistId}/{category}/{slug}
+interface MiruroEpisode {
+  id: string;
+  number: number;
+  title?: string;
+  description?: string | null;
+  image?: string | null;
+  airDate?: string | null;
+}
+
+interface MiruroEpisodesResponse {
+  providers?: Record<
+    string,
+    { episodes?: Record<string, MiruroEpisode[] | undefined> }
+  >;
+}
+
+// Frontend episode id: {anilistId}-{provider}-{category}-{slug}-episode-{number}
+// Watch.tsx derives `number` via split('-episode-')[1].match(/^\d+/) and
+// rebuilds the id as `{prefix}-episode-{number}` for deep links, so the
+// suffix must be exactly `-episode-{number}`.
+// Player.tsx derives the episode number via split('-').pop().
+function buildEpisodeId(
+  anilistId: string,
+  provider: string,
+  category: string,
+  slug: string,
+  number: number,
+): string {
+  return `${anilistId}-${provider}-${category}-${slug}-episode-${number}`;
+}
+
+interface ParsedEpisodeId {
+  anilistId: string;
+  provider: string;
+  category: string;
+  slug: string;
+  number: string;
+}
+
+function parseEpisodeId(episodeId: string): ParsedEpisodeId | null {
+  const match = episodeId.match(
+    /^(\d+)-([^-]+)-(sub|dub|es)-(.+)-episode-(\d+(?:-\d+)?)$/,
+  );
+  if (!match) return null;
+  const [, anilistId, provider, category, slug, number] = match;
+  return { anilistId, provider, category, slug, number };
+}
+
+// Order providers by MIRURO_PROVIDER_ORDER, appending any unknown providers.
+function orderProviderNames(names: string[]): string[] {
+  const known = MIRURO_PROVIDER_ORDER.filter((name) => names.includes(name));
+  const unknown = names.filter((name) => !MIRURO_PROVIDER_ORDER.includes(name));
+  return [...known, ...unknown];
+}
+
 // Error handling function
 // Function to handle errors and throw appropriately
-function handleError(error: any, context: string) {
+function handleError(error: unknown, context: string): never {
   let errorMessage = 'An error occurred';
+  const err = error as {
+    message?: string;
+    response?: { status?: number; data?: { message?: string } };
+  };
 
   // Handling CORS errors (Note: This is a simplification. Real CORS errors are hard to catch in JS)
-  if (error.message && error.message.includes('Access-Control-Allow-Origin')) {
+  if (err.message && err.message.includes('Access-Control-Allow-Origin')) {
     errorMessage = 'A CORS error occurred';
   }
 
@@ -50,18 +137,18 @@ function handleError(error: any, context: string) {
     // Extend with other cases as needed
   }
 
-  if (error.response) {
+  if (err.response) {
     // Extend with more nuanced handling based on HTTP status codes
-    const status = error.response.status;
-    if (status >= 500) {
+    const status = err.response.status;
+    if (status !== undefined && status >= 500) {
       errorMessage += ': Server error';
-    } else if (status >= 400) {
+    } else if (status !== undefined && status >= 400) {
       errorMessage += ': Client error';
     }
     // Include server-provided error message if available
-    errorMessage += `: ${error.response.data.message || 'Unknown error'}`;
-  } else if (error.message) {
-    errorMessage += `: ${error.message}`;
+    errorMessage += `: ${err.response.data?.message || 'Unknown error'}`;
+  } else if (err.message) {
+    errorMessage += `: ${err.message}`;
   }
 
   console.error(`${errorMessage}`, error);
@@ -75,7 +162,7 @@ function generateCacheKey(...args: string[]) {
 }
 
 interface CacheItem {
-  value: any; // Replace 'any' with a more specific type if possible
+  value: unknown;
   timestamp: number;
 }
 
@@ -116,7 +203,7 @@ function createOptimizedSessionStorageCache(
       }
       return undefined;
     },
-    set(key: string, value: any) {
+    set(key: string, value: unknown) {
       if (cache.size >= maxSize) {
         const oldestKey = keys.values().next().value;
         cache.delete(oldestKey);
@@ -162,11 +249,18 @@ const animeDataCache = createCache('Data');
 const animeInfoCache = createCache('Info');
 const animeEpisodesCache = createCache('Episodes');
 const fetchAnimeEmbeddedEpisodesCache = createCache('Video Embedded Sources');
-const videoSourcesCache = createCache('Video Sources');
+const videoSourcesCache = createCache('Video Sources 2');
 
 // Fetch data from proxy with caching
 // Function to fetch data from proxy with caching
-async function fetchFromProxy(url: string, cache: any, cacheKey: string) {
+async function fetchFromProxy(
+  url: string,
+  cache: {
+    get: (key: string) => unknown;
+    set: (key: string, value: unknown) => void;
+  },
+  cacheKey: string,
+) {
   try {
     // Attempt to retrieve the cached response using the cacheKey
     const cachedResponse = cache.get(cacheKey);
@@ -180,7 +274,10 @@ async function fetchFromProxy(url: string, cache: any, cacheKey: string) {
       : {}; // If PROXY_URL is not defined, make a direct request
 
     // Proceed with the network request
-    const response = await axiosInstance.get(PROXY_URL ? '' : url, requestConfig);
+    const response = await axiosInstance.get(
+      PROXY_URL ? '' : url,
+      requestConfig,
+    );
 
     // After obtaining the response, verify it for errors or empty data
     if (
@@ -189,7 +286,8 @@ async function fetchFromProxy(url: string, cache: any, cacheKey: string) {
     ) {
       const errorMessage = response.data.message || 'Unknown server error';
       throw new Error(
-        `Server error: ${response.data.statusCode || response.status
+        `Server error: ${
+          response.data.statusCode || response.status
         } ${errorMessage}`,
       );
     }
@@ -342,21 +440,89 @@ export const fetchUpcomingSeasons = (page: number, perPage: number) =>
   fetchList('Upcoming', page, perPage);
 
 // Fetch Anime Episodes Function
+// Mirrors the consumet episode shape expected by Watch.tsx, sourced from the
+// local Miruro-API instead of the (dead) consumet backend.
 export async function fetchAnimeEpisodes(
   animeId: string,
   provider: string = 'gogoanime',
   dub: boolean = false,
-) {
-  const params = new URLSearchParams({ provider, dub: dub ? 'true' : 'false' });
-  const url = `${BASE_URL}meta/anilist/episodes/${animeId}?${params.toString()}`;
+): Promise<Episode[]> {
+  const category = dub ? 'dub' : 'sub';
   const cacheKey = generateCacheKey(
     'animeEpisodes',
     animeId,
     provider,
-    dub ? 'dub' : 'sub',
+    category,
   );
 
-  return fetchFromProxy(url, animeEpisodesCache, cacheKey);
+  try {
+    const cached = animeEpisodesCache.get(cacheKey) as Episode[] | undefined;
+    if (cached) return cached;
+
+    const { data } = await miruroInstance.get<MiruroEpisodesResponse>(
+      `episodes/${animeId}`,
+    );
+    const providers = data?.providers ?? {};
+    const providerNames = orderProviderNames(Object.keys(providers));
+    const episodesOf = (name: string, cat: string) =>
+      providers[name]?.episodes?.[cat] ?? [];
+
+    // Prefer the requested category; if no provider has it (e.g. no dubs),
+    // fall back to sub so the page isn't a dead end.
+    let sourceProvider = providerNames.find(
+      (name) => episodesOf(name, category).length > 0,
+    );
+    let sourceCategory = category;
+    if (!sourceProvider && category !== 'sub') {
+      sourceProvider = providerNames.find(
+        (name) => episodesOf(name, 'sub').length > 0,
+      );
+      sourceCategory = 'sub';
+    }
+    if (!sourceProvider) {
+      animeEpisodesCache.set(cacheKey, []);
+      return [];
+    }
+
+    // Backfill image/description/airDate per episode number from any
+    // provider (most only populate these for some sources).
+    const metaByNumber = new Map<number, MiruroEpisode>();
+    for (const name of providerNames) {
+      for (const episodes of Object.values(providers[name]?.episodes ?? {})) {
+        for (const ep of episodes ?? []) {
+          if (!metaByNumber.has(ep.number)) metaByNumber.set(ep.number, ep);
+        }
+      }
+    }
+
+    const episodes = episodesOf(sourceProvider, sourceCategory)
+      .slice()
+      .sort((a, b) => a.number - b.number)
+      .map((ep) => {
+        const slug = ep.id.split('/').pop() ?? '';
+        const meta = metaByNumber.get(ep.number);
+        return {
+          id: buildEpisodeId(
+            animeId,
+            sourceProvider!,
+            sourceCategory,
+            slug,
+            ep.number,
+          ),
+          title: ep.title ?? `Episode ${ep.number}`,
+          description: ep.description ?? meta?.description ?? null,
+          number: ep.number,
+          image: ep.image ?? meta?.image ?? '',
+          imageHash: '',
+          airDate: ep.airDate ?? meta?.airDate ?? null,
+        };
+      });
+
+    animeEpisodesCache.set(cacheKey, episodes);
+    return episodes;
+  } catch (error) {
+    return handleError(error, 'anime episodes');
+  }
 }
 
 // Fetch Embedded Anime Episodes Servers
@@ -368,11 +534,127 @@ export async function fetchAnimeEmbeddedEpisodes(episodeId: string) {
 }
 
 // Function to fetch anime streaming links
-export async function fetchAnimeStreamingLinks(episodeId: string) {
-  const url = `${BASE_URL}meta/anilist/watch/${episodeId}`;
+// Parses our composite episode id, asks the local Miruro-API for streams,
+// and falls back to other providers for the same episode when one is dead.
+export async function fetchAnimeStreamingLinks(
+  episodeId: string,
+): Promise<WatchResponse> {
   const cacheKey = generateCacheKey('animeStreamingLinks', episodeId);
 
-  return fetchFromProxy(url, videoSourcesCache, cacheKey);
+  try {
+    const cached = videoSourcesCache.get(cacheKey) as WatchResponse | undefined;
+    if (cached) return cached;
+
+    const parsed = parseEpisodeId(episodeId);
+    if (!parsed) {
+      throw new Error(`Unrecognized episode id: ${episodeId}`);
+    }
+    const { anilistId, provider, category, slug, number } = parsed;
+
+    // Same episode, other providers (fresh slugs), in preference order.
+    const attempts = [{ provider, slug }];
+    try {
+      const { data } = await miruroInstance.get<MiruroEpisodesResponse>(
+        `episodes/${anilistId}`,
+      );
+      const providers = data?.providers ?? {};
+      for (const name of orderProviderNames(Object.keys(providers))) {
+        if (name === provider) continue;
+        const ep = (providers[name]?.episodes?.[category] ?? []).find(
+          (candidate) => String(candidate.number) === number,
+        );
+        const fallbackSlug = ep?.id.split('/').pop();
+        if (fallbackSlug) {
+          attempts.push({ provider: name, slug: fallbackSlug });
+        }
+      }
+    } catch {
+      // Episode re-resolution is best-effort; the primary attempt still runs.
+    }
+
+    let lastError: unknown;
+    for (const attempt of attempts) {
+      try {
+        const { data } = await miruroInstance.get(
+          `watch/${attempt.provider}/${anilistId}/${category}/${attempt.slug}`,
+        );
+        const response = transformMiruroWatchResponse(data);
+        videoSourcesCache.set(cacheKey, response);
+        return response;
+      } catch (error) {
+        lastError = error; // dead upstream (444/5xx) → try the next provider
+      }
+    }
+
+    console.error('All providers failed for streaming links', lastError);
+    throw lastError instanceof Error
+      ? lastError
+      : new Error('Failed to fetch streaming links');
+  } catch (error) {
+    return handleError(error, 'anime episodes');
+  }
+}
+
+// Reshape Miruro-API /watch payload into the consumet watch shape Player.tsx
+// expects: { sources: [{ quality, url }], download }. Exactly one source is
+// marked 'default' (Player picks that one).
+interface MiruroStream {
+  url?: string;
+  type?: string;
+  quality?: string | number;
+  server?: string;
+  default?: boolean;
+  referer?: string;
+}
+
+interface MiruroWatchResponse {
+  streams?: MiruroStream[];
+  download?: string;
+}
+
+interface WatchResponse {
+  sources: { quality: string; url: string; type?: string }[];
+  download: string;
+}
+
+// Route every stream through the Miruro-API /media proxy: provider CDNs
+// (e.g. vidcache behind animegg) 500 unless the Referer is their embed page,
+// which the browser can never send. The proxy forwards the embed referer and
+// the Range header, so seeking still returns 206.
+function viaMediaProxy(url: string, referer?: string): string {
+  const params = new URLSearchParams({ url });
+  if (referer) params.set('referer', referer);
+  return `${MIRURO_API}media?${params.toString()}`;
+}
+
+function transformMiruroWatchResponse(data: MiruroWatchResponse) {
+  const streams = (data.streams ?? []).filter(
+    (stream) =>
+      typeof stream.url === 'string' &&
+      (stream.type === 'hls' || stream.type === 'mp4'),
+  );
+
+  if (streams.length === 0) {
+    throw new Error('No playable streams returned');
+  }
+
+  const sources = streams.map((stream, index) => ({
+    quality: stream.default
+      ? 'default'
+      : String(stream.quality ?? stream.server ?? index),
+    url: viaMediaProxy(stream.url as string, stream.referer),
+    type: stream.type,
+  }));
+
+  if (!sources.some((source) => source.quality === 'default')) {
+    sources[0].quality = 'default';
+  }
+
+  const response: WatchResponse = {
+    sources,
+    download: data.download || sources[0].url,
+  };
+  return response;
 }
 
 // Function to fetch skip times for an anime episode
