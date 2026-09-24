@@ -1,0 +1,52 @@
+# Miruro — React 18 + Vite 5 SPA; aube (lockfile: aube-lock.yaml) + Bun runtime.
+# Docs: https://mise.jdx.dev/llms.txt
+
+[tools]
+# vite/eslint/prettier bins are `#!/usr/bin/env node` shebangs
+node = "lts"
+# package manager — lockfile is aube-lock.yaml (`aubr` = `aube run`)
+aube = "latest"
+# Express server runtime (`bun run ./server/server.ts`)
+bun = "latest"
+
+[env]
+# Project env — seeded via `mise run setup` (cp .env.example .env.local).
+# VITE_BACKEND_URL is NOT optional; vars are also read by server/server.ts.
+_.file = [".env", ".env.local"]
+# Expose package.json script bins (vite, eslint, prettier) directly on PATH
+_.path = ["{{config_root}}/node_modules/.bin"]
+
+[tasks.setup]
+description = "Install deps from aube-lock.yaml and seed .env.local from .env.example if missing"
+run = [
+  "aube install",
+  "test -f .env.local || cp .env.example .env.local",
+]
+
+[tasks.dev]
+description = "vite --host; port from VITE_PORT (default 5173), auto-opens browser"
+run = "aubr dev"
+
+[tasks.build]
+description = "vite build → dist/ (the only green verification gate)"
+run = "aubr build"
+
+[tasks.preview]
+description = "vite preview"
+run = "aubr preview"
+
+[tasks.start]
+description = "vite build && bun run ./server/server.ts (serves dist/ on VITE_PORT)"
+run = "aubr start"
+
+[tasks.lint]
+description = "eslint --max-warnings 0 (pre-existing errors; only fix files you touched)"
+run = "aubr lint"
+
+[tasks.format]
+description = "prettier --write . — rewrites the WHOLE repo; prefer targeted prettier on changed files"
+run = "aubr format"
+
+[tasks.deps]
+description = "Report installed versions that lag the registry"
+run = "aube outdated"
